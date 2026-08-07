@@ -12,6 +12,8 @@ rebuilt strictly for movie tickets.
 - Creates one private ticket visible only to the customer, Movie Staff, and the bot
 - Automatically pings the configured Movie Staff role when a new ticket opens
 - Staff claim, invoice, payment confirmation, QR-ticket delivery, completion, and closure
+- One-command `/complete` flow that automatically calculates and records the owner's 12% share
+- Duplicate-safe earnings ledger plus administrator-only `/earnings` totals
 - Each Movie Staff member can configure their own payment methods
 - Red **Close Ticket** button plus `/close`
 - Saves an HTML transcript before deleting a closed ticket
@@ -35,6 +37,8 @@ access theater accounts, bypass checkout systems, or automatically verify paymen
 5. Movie Staff verifies the screenshot and sends the exact 50%-off invoice.
 6. Choose a payment method, pay, select **I've Paid**, and upload proof.
 7. Movie Staff posts the QR ticket codes and any AMC snack pickup information.
+8. Movie Staff runs `/complete`; the bot automatically uses the saved verified
+   total, records the owner's 12% share, saves the transcript, and closes the ticket.
 
 ## Staff commands
 
@@ -47,6 +51,24 @@ access theater accounts, bypass checkout systems, or automatically verify paymen
 /complete
 /close reason:Tickets delivered successfully
 /order_info
+```
+
+`/complete` requires no amount and no manual calculation. It uses the checkout
+total submitted in the order form, or the corrected total previously saved with
+`/pay final_total:`. For example, a saved `$120.00` order total automatically
+records `$14.40` as the owner's 12% share. It records each order only once, saves
+the calculation in the private staff log, then saves the customer-safe transcript
+and closes the ticket. The bot requires payment to be confirmed with `/paid` first
+so cancelled or unpaid orders cannot be counted accidentally. Customers do not see
+the owner-share calculation.
+
+Use `/close` for cancelled, duplicate, or unfinished tickets. It saves the
+transcript without recording earnings.
+
+Administrators can view the running total with:
+
+```text
+/earnings
 ```
 
 Payment setup is separate for each Movie Staff member:
@@ -147,6 +169,7 @@ DISCORD_TOKEN=your_new_movie_bot_token
 DEV_GUILD_ID=your_discord_server_id
 MOVIE_STAFF_ROLE_ID=1535138119664402443
 CUSTOMER_NOTIFICATION_ROLE_ID=1515866262306033737
+OWNER_SHARE_PERCENT=12
 DATABASE_PATH=/app/data/movie_orders.db
 TRANSCRIPT_DIR=/app/data/transcripts
 LOG_LEVEL=INFO
@@ -166,7 +189,8 @@ The successful avatar version is stored in the persistent database so reconnects
 ordinary restarts do not repeatedly update the profile.
 
 The persistent volume keeps settings, orders, payment methods, storefront status,
-and transcript files through redeploys.
+owner-share totals, and transcript files through redeploys. `OWNER_SHARE_PERCENT`
+defaults to `12`, so the variable is optional unless you want to change the rate.
 
 ## Local tests
 

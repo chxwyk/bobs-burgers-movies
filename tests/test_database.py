@@ -98,6 +98,44 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotEqual(order.id, next_order.id)
 
+    async def test_complete_records_12_percent_only_once(self) -> None:
+        order = await self.db.create_order(
+            guild_id=1,
+            customer_id=30,
+            movie_showtime="Movie Night — 8:30 PM",
+            zip_code="89109",
+            seats=2,
+            snacks="None",
+            submitted_total_cents=12000,
+        )
+        order = await self.db.attach_channel(order.id, 199)
+
+        closed, first_recorded, first_share = await self.db.close_order_with_owner_share(
+            order.id,
+            guild_id=1,
+            share_percent=12,
+            actor_id=20,
+            reason="Completed",
+        )
+        _, second_recorded, second_share = await self.db.close_order_with_owner_share(
+            order.id,
+            guild_id=1,
+            share_percent=12,
+            actor_id=20,
+            reason="Duplicate completion",
+        )
+
+        self.assertEqual(closed.status, "closed")
+        self.assertTrue(first_recorded)
+        self.assertFalse(second_recorded)
+        self.assertEqual(first_share, 1440)
+        self.assertEqual(second_share, 1440)
+        summary = await self.db.get_owner_share_summary(1)
+        self.assertEqual(summary.owed_order_count, 1)
+        self.assertEqual(summary.owed_cents, 1440)
+        self.assertEqual(summary.lifetime_order_count, 1)
+        self.assertEqual(summary.lifetime_cents, 1440)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,7 @@ class Settings:
     dev_guild_id: int | None
     movie_staff_role_id: int | None
     customer_notification_role_id: int | None
+    owner_share_percent: int
     log_level: int
 
     @classmethod
@@ -68,6 +69,14 @@ class Settings:
                 raise ConfigError(f"{variable_name} must be a positive Discord role ID.")
             role_ids[variable_name] = parsed_value
 
+        raw_owner_share_percent = os.getenv("OWNER_SHARE_PERCENT", "12").strip()
+        try:
+            owner_share_percent = int(raw_owner_share_percent)
+        except ValueError as exc:
+            raise ConfigError("OWNER_SHARE_PERCENT must be a whole percentage.") from exc
+        if not 1 <= owner_share_percent <= 100:
+            raise ConfigError("OWNER_SHARE_PERCENT must be between 1 and 100.")
+
         log_name = os.getenv("LOG_LEVEL", "INFO").upper()
         log_level = getattr(logging, log_name, None)
         if not isinstance(log_level, int):
@@ -80,5 +89,6 @@ class Settings:
             dev_guild_id=dev_guild_id,
             movie_staff_role_id=role_ids["MOVIE_STAFF_ROLE_ID"],
             customer_notification_role_id=role_ids["CUSTOMER_NOTIFICATION_ROLE_ID"],
+            owner_share_percent=owner_share_percent,
             log_level=log_level,
         )

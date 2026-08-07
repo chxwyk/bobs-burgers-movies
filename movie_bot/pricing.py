@@ -61,6 +61,14 @@ def discounted_price_cents(
     return (total_cents * customer_basis_points + 5_000) // 10_000
 
 
+def percentage_share_cents(total_cents: int, percent: int) -> int:
+    if total_cents < 0:
+        raise InputError("The total cannot be negative.")
+    if not 1 <= percent <= 100:
+        raise ValueError("The percentage must be between 1 and 100.")
+    return (total_cents * percent + 50) // 100
+
+
 def format_cents(cents: int) -> str:
     sign = "-" if cents < 0 else ""
     absolute = abs(cents)

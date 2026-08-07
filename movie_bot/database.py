@@ -8,8 +8,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
-from .models import GuildSettings, MovieOrder, PaymentMethod
-from .pricing import DEFAULT_DISCOUNT_BASIS_POINTS, discounted_price_cents
+from .models import GuildSettings, MovieOrder, OwnerShareSummary, PaymentMethod
+from .pricing import (
+    DEFAULT_DISCOUNT_BASIS_POINTS,
+    discounted_price_cents,
+    percentage_share_cents,
+)
 
 T = TypeVar("T")
 
@@ -77,6 +81,23 @@ CREATE TABLE IF NOT EXISTS application_state (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS owner_shares (
+    order_id INTEGER PRIMARY KEY,
+    guild_id INTEGER NOT NULL,
+    order_total_cents INTEGER NOT NULL CHECK (order_total_cents > 0),
+    share_percent INTEGER NOT NULL CHECK (share_percent BETWEEN 1 AND 100),
+    share_cents INTEGER NOT NULL CHECK (share_cents > 0),
+    status TEXT NOT NULL DEFAULT 'owed' CHECK (status IN ('owed', 'paid')),
+    recorded_by INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL,
+    settled_by INTEGER,
+    settled_at TEXT,
+    FOREIGN KEY(order_id) REFERENCES movie_orders(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS owner_shares_by_guild_status
+ON owner_shares(guild_id, status, recorded_at);
 
 CREATE TABLE IF NOT EXISTS order_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -529,6 +550,118 @@ class Database:
             order = await self._run(operation)
         await self.add_event(order_id, status, actor_id=actor_id, details=details)
         return order
+
+    async def close_order_with_owner_share(
+        self,
+        order_id: int,
+        *,
+        guild_id: int,
+        share_percent: int,
+        actor_id: int,
+        reason: str,
+    ) -> tuple[MovieOrder, bool, int]:
+        now = _now()
+
+        def operation() -> tuple[MovieOrder, bool, int]:
+            with self._connect() as connection:
+                existing = connection.execute(
+                    "SELECT guild_id, submitted_total_cents FROM movie_orders WHERE id = ?",
+                    (order_id,),
+                ).fetchone()
+                if existing is None:
+                    raise ValueError(f"Movie order {order_id} does not exist.")
+                if int(existing["guild_id"]) != guild_id:
+                    raise ValueError("Movie order does not belong to this Discord server.")
+
+                order_total_cents = int(existing["submitted_total_cents"])
+                share_cents = percentage_share_cents(order_total_cents, share_percent)
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO owner_shares (
+                        order_id, guild_id, order_total_cents, share_percent,
+                        share_cents, status, recorded_by, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, 'owed', ?, ?)
+                    """,
+                    (
+                        order_id,
+                        guild_id,
+                        order_total_cents,
+                        share_percent,
+                        share_cents,
+                        actor_id,
+                        now,
+                    ),
+                )
+                share_recorded = cursor.rowcount > 0
+                connection.execute(
+                    """
+                    UPDATE movie_orders
+                    SET status = 'closed', updated_at = ?,
+                        closed_at = COALESCE(closed_at, ?)
+                    WHERE id = ?
+                    """,
+                    (now, now, order_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO order_events (
+                        order_id, actor_id, event_type, details_json, created_at
+                    ) VALUES (?, ?, 'completed_with_owner_share', ?, ?)
+                    """,
+                    (
+                        order_id,
+                        actor_id,
+                        json.dumps(
+                            {
+                                "reason": reason,
+                                "order_total_cents": order_total_cents,
+                                "owner_share_percent": share_percent,
+                                "owner_share_cents": share_cents,
+                                "share_recorded": share_recorded,
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM movie_orders WHERE id = ?", (order_id,)
+                ).fetchone()
+
+            order = _order_from_row(row)
+            assert order is not None
+            return order, share_recorded, share_cents
+
+        async with self._write_lock:
+            return await self._run(operation)
+
+    async def get_owner_share_summary(self, guild_id: int) -> OwnerShareSummary:
+        def operation() -> OwnerShareSummary:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS lifetime_order_count,
+                        COALESCE(SUM(share_cents), 0) AS lifetime_cents,
+                        COALESCE(SUM(CASE WHEN status = 'owed' THEN 1 ELSE 0 END), 0)
+                            AS owed_order_count,
+                        COALESCE(SUM(CASE WHEN status = 'owed' THEN share_cents ELSE 0 END), 0)
+                            AS owed_cents
+                    FROM owner_shares
+                    WHERE guild_id = ?
+                    """,
+                    (guild_id,),
+                ).fetchone()
+                assert row is not None
+                return OwnerShareSummary(
+                    owed_order_count=int(row["owed_order_count"]),
+                    owed_cents=int(row["owed_cents"]),
+                    lifetime_order_count=int(row["lifetime_order_count"]),
+                    lifetime_cents=int(row["lifetime_cents"]),
+                )
+
+        return await self._run(operation)
 
     async def add_event(
         self,

@@ -44,3 +44,11 @@ class PaymentMethod:
     name: str
     instructions: str
     enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerShareSummary:
+    owed_order_count: int
+    owed_cents: int
+    lifetime_order_count: int
+    lifetime_cents: int

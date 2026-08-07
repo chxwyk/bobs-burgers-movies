@@ -19,6 +19,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.dev_guild_id, 123456789012345678)
         self.assertEqual(settings.movie_staff_role_id, 1535138119664402443)
         self.assertEqual(settings.customer_notification_role_id, 1515866262306033737)
+        self.assertEqual(settings.owner_share_percent, 12)
         self.assertEqual(str(settings.database_path), "/tmp/movie.db")
 
     def test_role_ids_can_be_overridden(self) -> None:
@@ -31,6 +32,26 @@ class ConfigTests(unittest.TestCase):
             settings = Settings.from_env()
         self.assertEqual(settings.movie_staff_role_id, 111)
         self.assertEqual(settings.customer_notification_role_id, 222)
+
+    def test_owner_share_percentage_can_be_changed(self) -> None:
+        environment = {
+            "DISCORD_TOKEN": "test-token",
+            "OWNER_SHARE_PERCENT": "10",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.owner_share_percent, 10)
+
+    def test_owner_share_percentage_must_be_valid(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {"DISCORD_TOKEN": "test-token", "OWNER_SHARE_PERCENT": "0"},
+                clear=True,
+            ),
+            self.assertRaises(ConfigError),
+        ):
+            Settings.from_env()
 
     def test_requires_token(self) -> None:
         with (
