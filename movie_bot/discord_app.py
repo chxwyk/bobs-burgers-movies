@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -39,6 +40,8 @@ PURPLE = discord.Color.from_rgb(145, 70, 255)
 SUCCESS = discord.Color.from_rgb(46, 204, 113)
 WARNING = discord.Color.from_rgb(241, 196, 15)
 ERROR = discord.Color.from_rgb(231, 76, 60)
+COMPLETED_TICKET_RETENTION = timedelta(hours=12)
+SCHEDULED_CLOSE_RETRY_SECONDS = 5 * 60
 KNOWN_PAYMENT_METHODS = (
     "Cash App",
     "Apple Pay",
@@ -820,7 +823,7 @@ async def _close_ticket(
                 assert calculated_share_cents == recorded_share_cents
                 log_embed.set_footer(
                     text=(
-                        "Owner share recorded automatically by /complete."
+                        "Owner share recorded automatically by /done."
                         if share_recorded
                         else "Owner share was already recorded for this order."
                     )
@@ -838,7 +841,7 @@ async def _close_ticket(
             LOGGER.exception("Could not finalize movie order %s", order.id)
             await interaction.followup.send(
                 "The transcript was uploaded, but the order calculation could not be "
-                "saved. The ticket was left open; please run `/complete` again.",
+                "saved. The ticket was left open; please run `/done` again.",
                 ephemeral=True,
             )
             return
@@ -871,6 +874,133 @@ async def _close_ticket(
         )
     finally:
         bot.closing_channels.discard(interaction.channel.id)
+
+
+def _scheduled_close_datetime(value: str) -> datetime:
+    close_at = datetime.fromisoformat(value)
+    return close_at.replace(tzinfo=UTC) if close_at.tzinfo is None else close_at
+
+
+async def _archive_completed_movie_order(bot: MovieOrdersBot, order_id: int) -> bool:
+    order = await bot.db.get_order(order_id)
+    if order is None or order.status in {"closed", "cancelled"}:
+        return True
+    if order.status != "completed" or order.channel_id is None:
+        return True
+
+    guild = bot.get_guild(order.guild_id)
+    if guild is None:
+        return False
+    channel = guild.get_channel(order.channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        await bot.db.set_order_status(
+            order.id,
+            "closed",
+            actor_id=order.completed_by,
+            details={"reason": "Scheduled ticket channel no longer exists"},
+        )
+        return True
+    if channel.id in bot.closing_channels:
+        return False
+
+    settings = await bot.db.get_guild_settings(order.guild_id)
+    if settings is None:
+        return False
+    log_channel = guild.get_channel(settings.log_channel_id)
+    if not isinstance(log_channel, discord.TextChannel):
+        return False
+
+    bot.closing_channels.add(channel.id)
+    try:
+        messages = await _collect_transcript_messages(channel)
+        transcript_html = render_transcript_html(
+            guild_name=guild.name,
+            channel_name=channel.name,
+            order=replace(order, status="completed"),
+            messages=messages,
+        )
+        transcript_path = save_transcript(
+            bot.settings.transcript_dir / f"movie-order-{order.id:06d}.html",
+            transcript_html,
+        )
+        share = await bot.db.get_owner_share_for_order(order.id)
+        log_embed = discord.Embed(
+            title=f"🎬 Movie Order #{order.id:06d} Auto-Closed",
+            description="The 12-hour customer access window ended.",
+            color=discord.Color.dark_grey(),
+        )
+        log_embed.add_field(name="Customer", value=f"<@{order.customer_id}>", inline=True)
+        log_embed.add_field(name="Movie", value=order.movie_showtime[:1024], inline=False)
+        log_embed.add_field(
+            name="Verified Order Total",
+            value=format_cents(order.submitted_total_cents),
+            inline=True,
+        )
+        if share is not None:
+            share_percent, share_cents = share
+            log_embed.add_field(
+                name=f"Owner Share ({share_percent}%)",
+                value=f"**{format_cents(share_cents)}**",
+                inline=True,
+            )
+        log_embed.set_footer(text="Transcript captured after the 12-hour access window.")
+        try:
+            await log_channel.send(
+                embed=log_embed,
+                file=discord.File(transcript_path),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            LOGGER.exception("Could not archive scheduled movie order %s", order.id)
+            return False
+
+        customer = guild.get_member(order.customer_id)
+        if customer is not None:
+            with contextlib.suppress(discord.Forbidden, discord.HTTPException):
+                await customer.send(
+                    content=f"Your movie order #{order.id:06d} was closed after 12 hours.",
+                    file=discord.File(transcript_path),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+        with contextlib.suppress(discord.Forbidden, discord.HTTPException):
+            await channel.send(
+                "🔒 The 12-hour access window has ended. Transcript saved; closing "
+                "this ticket in 5 seconds.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        await asyncio.sleep(5)
+        try:
+            await channel.delete(reason=f"Movie order #{order.id:06d} 12-hour window ended")
+        except (discord.Forbidden, discord.HTTPException):
+            LOGGER.exception("Could not delete scheduled movie ticket %s", channel.id)
+            return False
+        await bot.db.set_order_status(
+            order.id,
+            "closed",
+            actor_id=order.completed_by,
+            details={"reason": "12-hour completed-ticket access window ended"},
+        )
+        return True
+    finally:
+        bot.closing_channels.discard(channel.id)
+
+
+async def _scheduled_close_worker(
+    bot: MovieOrdersBot, order_id: int, scheduled_close_at: str
+) -> None:
+    close_at = _scheduled_close_datetime(scheduled_close_at)
+    delay = max(0.0, (close_at - datetime.now(UTC)).total_seconds())
+    await asyncio.sleep(delay)
+    while True:
+        try:
+            if await _archive_completed_movie_order(bot, order_id):
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Scheduled close failed for movie order %s", order_id)
+        await asyncio.sleep(SCHEDULED_CLOSE_RETRY_SECONDS)
 
 
 async def _refresh_saved_panel(
@@ -1397,15 +1527,15 @@ class MovieCommands(commands.Cog):
             ),
         )
 
-    @app_commands.command(
-        name="complete",
-        description="Complete, calculate the owner share, save transcript, and close",
-    )
-    @app_commands.guild_only()
-    async def complete(self, interaction: discord.Interaction) -> None:
+    async def _finish_successful_order(self, interaction: discord.Interaction) -> None:
         order = await _ticket_order(self.bot, interaction)
         settings = await _configured_settings(self.bot, interaction)
-        if order is None or settings is None:
+        if (
+            order is None
+            or settings is None
+            or interaction.guild is None
+            or not isinstance(interaction.channel, discord.TextChannel)
+        ):
             return
         if not _is_staff(interaction.user, settings):
             await _ephemeral(interaction, "Only Movie Staff can complete orders.")
@@ -1419,20 +1549,82 @@ class MovieCommands(commands.Cog):
         if order.status in {"closed", "cancelled"}:
             await _ephemeral(interaction, "This movie order is already closed.")
             return
+        if order.status == "completed":
+            close_text = (
+                f" It will close <t:{int(_scheduled_close_datetime(order.scheduled_close_at).timestamp())}:R>."
+                if order.scheduled_close_at
+                else ""
+            )
+            await _ephemeral(
+                interaction,
+                "This movie order is already completed and its 12% share was already "
+                f"recorded.{close_text}",
+            )
+            return
         if order.status not in {"paid", "tickets_sent"}:
             await _ephemeral(
                 interaction,
-                "Confirm the customer's payment with `/paid` before using `/complete`.",
+                "Confirm the customer's payment with `/paid` before using `/done`.",
             )
             return
         if order.assigned_staff_id is None:
-            await self.bot.db.assign_order(order.id, interaction.user.id)
-        await _close_ticket(
-            self.bot,
-            interaction,
-            reason="Movie tickets delivered and order completed",
-            owner_share_percent=self.bot.settings.owner_share_percent,
+            order = await self.bot.db.assign_order(order.id, interaction.user.id)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        requested_close_at = discord.utils.utcnow() + COMPLETED_TICKET_RETENTION
+        order, share_recorded, share_cents = await self.bot.db.complete_order_with_owner_share(
+            order.id,
+            guild_id=interaction.guild.id,
+            share_percent=self.bot.settings.owner_share_percent,
+            actor_id=interaction.user.id,
+            scheduled_close_at=requested_close_at.isoformat(),
         )
+        assert order.scheduled_close_at is not None
+        close_at = _scheduled_close_datetime(order.scheduled_close_at)
+        close_timestamp = int(close_at.timestamp())
+        self.bot.schedule_completed_order(order.id, order.scheduled_close_at)
+
+        await interaction.channel.send(
+            content=f"<@{order.customer_id}>",
+            embed=discord.Embed(
+                title="✅ Movie Order Completed",
+                description=(
+                    "Your order is complete. This ticket will remain available for "
+                    "**12 hours** so you can save your ticket links, QR codes, and pickup "
+                    "information.\n\n"
+                    f"**Automatic close:** <t:{close_timestamp}:F> "
+                    f"(<t:{close_timestamp}:R>)"
+                ),
+                color=SUCCESS,
+            ),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        share_status = "recorded" if share_recorded else "was already recorded"
+        await interaction.followup.send(
+            (
+                f"Completed. Verified total: **{format_cents(order.submitted_total_cents)}**. "
+                f"Your {self.bot.settings.owner_share_percent}% share is "
+                f"**{format_cents(share_cents)}** and {share_status}. The ticket will "
+                f"close automatically <t:{close_timestamp}:R>."
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="done",
+        description="Alias for /complete: record 12% and schedule the 12-hour close",
+    )
+    @app_commands.guild_only()
+    async def done(self, interaction: discord.Interaction) -> None:
+        await self._finish_successful_order(interaction)
+
+    @app_commands.command(
+        name="complete",
+        description="Record the owner's 12% share and close the ticket after 12 hours",
+    )
+    @app_commands.guild_only()
+    async def complete(self, interaction: discord.Interaction) -> None:
+        await self._finish_successful_order(interaction)
 
     @app_commands.command(name="close", description="Save the transcript and close this ticket")
     @app_commands.guild_only()
@@ -1479,7 +1671,7 @@ class MovieCommands(commands.Cog):
             ),
             inline=False,
         )
-        embed.set_footer(text="Only /complete records earnings. /close does not.")
+        embed.set_footer(text="Only /done or /complete records earnings. /close does not.")
         await _ephemeral(interaction, embed=embed)
 
     @app_commands.command(name="order_info", description="Show the current movie order details")
@@ -1524,7 +1716,42 @@ class MovieOrdersBot(commands.Bot):
         self.settings = settings
         self.db = Database(settings.database_path)
         self.closing_channels: set[int] = set()
+        self.scheduled_close_tasks: dict[int, asyncio.Task[None]] = {}
+        self._scheduled_closures_restored = False
         self._avatar_sync_attempted = False
+
+    def schedule_completed_order(self, order_id: int, scheduled_close_at: str) -> None:
+        existing = self.scheduled_close_tasks.get(order_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            _scheduled_close_worker(self, order_id, scheduled_close_at),
+            name=f"movie-order-{order_id}-scheduled-close",
+        )
+        self.scheduled_close_tasks[order_id] = task
+
+        def remove_finished(finished: asyncio.Task[None]) -> None:
+            if self.scheduled_close_tasks.get(order_id) is finished:
+                self.scheduled_close_tasks.pop(order_id, None)
+            if not finished.cancelled() and (error := finished.exception()) is not None:
+                LOGGER.error(
+                    "Scheduled movie close task %s failed",
+                    order_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(remove_finished)
+
+    async def _restore_scheduled_closures(self) -> None:
+        if self._scheduled_closures_restored:
+            return
+        pending = await self.db.get_pending_scheduled_closures()
+        self._scheduled_closures_restored = True
+        for order in pending:
+            if order.scheduled_close_at is not None:
+                self.schedule_completed_order(order.id, order.scheduled_close_at)
+        if pending:
+            LOGGER.info("Restored %s scheduled movie ticket close(s)", len(pending))
 
     async def _sync_brand_avatar(self) -> None:
         if self._avatar_sync_attempted or self.user is None:
@@ -1577,6 +1804,7 @@ class MovieOrdersBot(commands.Bot):
     async def on_ready(self) -> None:
         if self.user is not None:
             await self._sync_brand_avatar()
+            await self._restore_scheduled_closures()
             LOGGER.info(
                 "Ready as %s (%s) in %s guild(s)",
                 self.user,

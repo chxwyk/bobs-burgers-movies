@@ -51,12 +51,14 @@ CREATE TABLE IF NOT EXISTS movie_orders (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    closed_at TEXT
+    closed_at TEXT,
+    scheduled_close_at TEXT,
+    completed_by INTEGER
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_movie_order_per_customer
 ON movie_orders(guild_id, customer_id)
-WHERE status NOT IN ('closed', 'cancelled');
+WHERE status NOT IN ('closed', 'cancelled', 'completed');
 
 CREATE TABLE IF NOT EXISTS payment_methods (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +160,8 @@ def _order_from_row(row: sqlite3.Row | None) -> MovieOrder | None:
         status=row["status"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        scheduled_close_at=row["scheduled_close_at"],
+        completed_by=row["completed_by"],
     )
 
 
@@ -194,6 +198,28 @@ class Database:
             with self._connect() as connection:
                 connection.execute("PRAGMA journal_mode = WAL")
                 connection.executescript(SCHEMA)
+                order_columns = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(movie_orders)").fetchall()
+                }
+                if "scheduled_close_at" not in order_columns:
+                    connection.execute(
+                        "ALTER TABLE movie_orders ADD COLUMN scheduled_close_at TEXT"
+                    )
+                if "completed_by" not in order_columns:
+                    connection.execute(
+                        "ALTER TABLE movie_orders ADD COLUMN completed_by INTEGER"
+                    )
+                # Completed tickets remain visible for 12 hours, but they must not
+                # prevent the customer from creating a new movie order.
+                connection.execute("DROP INDEX IF EXISTS one_active_movie_order_per_customer")
+                connection.execute(
+                    """
+                    CREATE UNIQUE INDEX one_active_movie_order_per_customer
+                    ON movie_orders(guild_id, customer_id)
+                    WHERE status NOT IN ('closed', 'cancelled', 'completed')
+                    """
+                )
 
         async with self._write_lock:
             await self._run(operation)
@@ -407,6 +433,16 @@ class Database:
     async def cancel_order_creation(self, order_id: int) -> None:
         await self.set_order_status(order_id, "cancelled", actor_id=None)
 
+    async def get_order(self, order_id: int) -> MovieOrder | None:
+        def operation() -> MovieOrder | None:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM movie_orders WHERE id = ?", (order_id,)
+                ).fetchone()
+                return _order_from_row(row)
+
+        return await self._run(operation)
+
     async def get_order_by_channel(self, channel_id: int) -> MovieOrder | None:
         def operation() -> MovieOrder | None:
             with self._connect() as connection:
@@ -426,7 +462,7 @@ class Database:
                     """
                     SELECT * FROM movie_orders
                     WHERE guild_id = ? AND customer_id = ?
-                      AND status NOT IN ('closed', 'cancelled')
+                      AND status NOT IN ('closed', 'cancelled', 'completed')
                     ORDER BY id DESC LIMIT 1
                     """,
                     (guild_id, customer_id),
@@ -635,6 +671,130 @@ class Database:
 
         async with self._write_lock:
             return await self._run(operation)
+
+    async def complete_order_with_owner_share(
+        self,
+        order_id: int,
+        *,
+        guild_id: int,
+        share_percent: int,
+        actor_id: int,
+        scheduled_close_at: str,
+    ) -> tuple[MovieOrder, bool, int]:
+        """Record the owner share and schedule closure without closing the ticket."""
+        now = _now()
+
+        def operation() -> tuple[MovieOrder, bool, int]:
+            with self._connect() as connection:
+                existing = connection.execute(
+                    """
+                    SELECT guild_id, submitted_total_cents, status, scheduled_close_at
+                    FROM movie_orders WHERE id = ?
+                    """,
+                    (order_id,),
+                ).fetchone()
+                if existing is None:
+                    raise ValueError(f"Movie order {order_id} does not exist.")
+                if int(existing["guild_id"]) != guild_id:
+                    raise ValueError("Movie order does not belong to this Discord server.")
+                if str(existing["status"]) in {"closed", "cancelled"}:
+                    raise ValueError("Movie order is already closed.")
+
+                order_total_cents = int(existing["submitted_total_cents"])
+                share_cents = percentage_share_cents(order_total_cents, share_percent)
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO owner_shares (
+                        order_id, guild_id, order_total_cents, share_percent,
+                        share_cents, status, recorded_by, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, 'owed', ?, ?)
+                    """,
+                    (
+                        order_id,
+                        guild_id,
+                        order_total_cents,
+                        share_percent,
+                        share_cents,
+                        actor_id,
+                        now,
+                    ),
+                )
+                share_recorded = cursor.rowcount > 0
+                effective_close_at = existing["scheduled_close_at"] or scheduled_close_at
+                connection.execute(
+                    """
+                    UPDATE movie_orders
+                    SET status = 'completed', updated_at = ?,
+                        scheduled_close_at = ?, completed_by = COALESCE(completed_by, ?)
+                    WHERE id = ?
+                    """,
+                    (now, effective_close_at, actor_id, order_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO order_events (
+                        order_id, actor_id, event_type, details_json, created_at
+                    ) VALUES (?, ?, 'completed_close_scheduled', ?, ?)
+                    """,
+                    (
+                        order_id,
+                        actor_id,
+                        json.dumps(
+                            {
+                                "order_total_cents": order_total_cents,
+                                "owner_share_percent": share_percent,
+                                "owner_share_cents": share_cents,
+                                "share_recorded": share_recorded,
+                                "scheduled_close_at": effective_close_at,
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM movie_orders WHERE id = ?", (order_id,)
+                ).fetchone()
+
+            order = _order_from_row(row)
+            assert order is not None
+            return order, share_recorded, share_cents
+
+        async with self._write_lock:
+            return await self._run(operation)
+
+    async def get_pending_scheduled_closures(self) -> list[MovieOrder]:
+        def operation() -> list[MovieOrder]:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM movie_orders
+                    WHERE status = 'completed'
+                      AND scheduled_close_at IS NOT NULL
+                      AND channel_id IS NOT NULL
+                    ORDER BY scheduled_close_at, id
+                    """
+                ).fetchall()
+                return [order for row in rows if (order := _order_from_row(row))]
+
+        return await self._run(operation)
+
+    async def get_owner_share_for_order(self, order_id: int) -> tuple[int, int] | None:
+        def operation() -> tuple[int, int] | None:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT share_percent, share_cents
+                    FROM owner_shares WHERE order_id = ?
+                    """,
+                    (order_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return int(row["share_percent"]), int(row["share_cents"])
+
+        return await self._run(operation)
 
     async def get_owner_share_summary(self, guild_id: int) -> OwnerShareSummary:
         def operation() -> OwnerShareSummary:

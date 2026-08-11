@@ -12,7 +12,9 @@ rebuilt strictly for movie tickets.
 - Creates one private ticket visible only to the customer, Movie Staff, and the bot
 - Automatically pings the configured Movie Staff role when a new ticket opens
 - Staff claim, invoice, payment confirmation, QR-ticket delivery, completion, and closure
-- One-command `/complete` flow that automatically calculates and records the owner's 12% share
+- One-command `/complete` flow that immediately calculates and records the owner's 12% share
+- Completed tickets remain available to customers for 12 hours, then the bot saves
+  the final transcript and deletes the ticket automatically—even after a Railway restart
 - Duplicate-safe earnings ledger plus administrator-only `/earnings` totals
 - Each Movie Staff member can configure their own payment methods
 - Red **Close Ticket** button plus `/close`
@@ -38,7 +40,9 @@ access theater accounts, bypass checkout systems, or automatically verify paymen
 6. Choose a payment method, pay, select **I've Paid**, and upload proof.
 7. Movie Staff posts the QR ticket codes and any AMC snack pickup information.
 8. Movie Staff runs `/complete`; the bot automatically uses the saved verified
-   total, records the owner's 12% share, saves the transcript, and closes the ticket.
+   total and immediately records the owner's 12% share.
+9. The customer has 12 hours to save QR codes, links, and pickup information.
+   The bot then saves the final transcript and closes the ticket automatically.
 
 ## Staff commands
 
@@ -49,6 +53,7 @@ access theater accounts, bypass checkout systems, or automatically verify paymen
 /paid
 /tickets_sent details:QR codes attached. AMC snacks are under the customer's name.
 /complete
+/done (backup alias for /complete)
 /close reason:Tickets delivered successfully
 /order_info
 ```
@@ -56,9 +61,11 @@ access theater accounts, bypass checkout systems, or automatically verify paymen
 `/complete` requires no amount and no manual calculation. It uses the checkout
 total submitted in the order form, or the corrected total previously saved with
 `/pay final_total:`. For example, a saved `$120.00` order total automatically
-records `$14.40` as the owner's 12% share. It records each order only once, saves
-the calculation in the private staff log, then saves the customer-safe transcript
-and closes the ticket. The bot requires payment to be confirmed with `/paid` first
+records `$14.40` as the owner's 12% share. It records each order only once and
+immediately adds the calculation to `/earnings`. The ticket remains open for 12
+hours; the bot then saves the customer-safe transcript and deletes the channel.
+Scheduled closures are restored after Railway restarts. The bot requires payment
+to be confirmed with `/paid` first
 so cancelled or unpaid orders cannot be counted accidentally. Customers do not see
 the owner-share calculation.
 

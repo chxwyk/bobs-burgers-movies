@@ -136,6 +136,56 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary.lifetime_order_count, 1)
         self.assertEqual(summary.lifetime_cents, 1440)
 
+    async def test_complete_records_share_and_schedules_close_without_closing(self) -> None:
+        order = await self.db.create_order(
+            guild_id=1,
+            customer_id=31,
+            movie_showtime="Movie Night — 9:00 PM",
+            zip_code="89109",
+            seats=2,
+            snacks="None",
+            submitted_total_cents=4200,
+        )
+        order = await self.db.attach_channel(order.id, 200)
+        scheduled_close_at = "2026-08-12T12:00:00+00:00"
+
+        completed, first_recorded, first_share = await self.db.complete_order_with_owner_share(
+            order.id,
+            guild_id=1,
+            share_percent=12,
+            actor_id=20,
+            scheduled_close_at=scheduled_close_at,
+        )
+        repeated, second_recorded, second_share = await self.db.complete_order_with_owner_share(
+            order.id,
+            guild_id=1,
+            share_percent=12,
+            actor_id=20,
+            scheduled_close_at="2026-08-13T12:00:00+00:00",
+        )
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(completed.scheduled_close_at, scheduled_close_at)
+        self.assertEqual(repeated.scheduled_close_at, scheduled_close_at)
+        self.assertTrue(first_recorded)
+        self.assertFalse(second_recorded)
+        self.assertEqual(first_share, 504)
+        self.assertEqual(second_share, 504)
+        pending = await self.db.get_pending_scheduled_closures()
+        self.assertEqual([item.id for item in pending], [order.id])
+        self.assertEqual(await self.db.get_owner_share_for_order(order.id), (12, 504))
+
+        next_order = await self.db.create_order(
+            guild_id=1,
+            customer_id=31,
+            movie_showtime="Second Movie — 11:00 PM",
+            zip_code="89109",
+            seats=1,
+            snacks="None",
+            submitted_total_cents=4000,
+        )
+        self.assertNotEqual(next_order.id, order.id)
+
 
 if __name__ == "__main__":
     unittest.main()

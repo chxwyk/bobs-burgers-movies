@@ -34,6 +34,8 @@ class MovieOrder:
     status: str
     created_at: str
     updated_at: str
+    scheduled_close_at: str | None = None
+    completed_by: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
