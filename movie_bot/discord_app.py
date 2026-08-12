@@ -1527,12 +1527,21 @@ class MovieCommands(commands.Cog):
             ),
         )
 
-    async def _finish_successful_order(self, interaction: discord.Interaction) -> None:
-        order = await _ticket_order(self.bot, interaction)
+    async def _finish_successful_order(
+        self,
+        interaction: discord.Interaction,
+        *,
+        legacy_total: str | None = None,
+        customer: discord.Member | None = None,
+    ) -> None:
+        order = (
+            await self.bot.db.get_order_by_channel(interaction.channel_id)
+            if interaction.channel_id is not None
+            else None
+        )
         settings = await _configured_settings(self.bot, interaction)
         if (
-            order is None
-            or settings is None
+            settings is None
             or interaction.guild is None
             or not isinstance(interaction.channel, discord.TextChannel)
         ):
@@ -1540,6 +1549,54 @@ class MovieCommands(commands.Cog):
         if not _is_staff(interaction.user, settings):
             await _ephemeral(interaction, "Only Movie Staff can complete orders.")
             return
+        if order is None:
+            if not interaction.channel.name.startswith("movie-"):
+                await _ephemeral(interaction, "Use this inside a movie order ticket.")
+                return
+            if legacy_total is None:
+                await _ephemeral(
+                    interaction,
+                    "This is an older movie ticket. Run `/complete legacy_total:42 "
+                    "customer:@Customer` to reconnect it, record 12%, and schedule its close.",
+                )
+                return
+            if customer is None and interaction.channel.topic:
+                topic_customer = re.search(
+                    r"\bCustomer\s+(\d{15,22})\b", interaction.channel.topic
+                )
+                if topic_customer:
+                    customer = interaction.guild.get_member(int(topic_customer.group(1)))
+            if customer is None:
+                await _ephemeral(
+                    interaction,
+                    "I could not identify the customer from this older channel. Run "
+                    "`/complete legacy_total:42 customer:@Customer`.",
+                )
+                return
+            if customer.bot:
+                await _ephemeral(interaction, "The selected customer cannot be a bot.")
+                return
+            try:
+                total_cents = parse_money(legacy_total)
+            except InputError as exc:
+                await _ephemeral(interaction, str(exc))
+                return
+            try:
+                order = await self.bot.db.import_legacy_ticket(
+                    guild_id=interaction.guild.id,
+                    customer_id=customer.id,
+                    channel_id=interaction.channel.id,
+                    movie_showtime=f"Recovered legacy ticket: {interaction.channel.name}",
+                    submitted_total_cents=total_cents,
+                    assigned_staff_id=interaction.user.id,
+                )
+            except ActiveOrderExistsError:
+                await _ephemeral(
+                    interaction,
+                    "That customer already has another active movie order. Close or complete "
+                    "that order first, then retry this recovery.",
+                )
+                return
         if order.assigned_staff_id not in {None, interaction.user.id}:
             await _ephemeral(
                 interaction,
@@ -1623,8 +1680,21 @@ class MovieCommands(commands.Cog):
         description="Record the owner's 12% share and close the ticket after 12 hours",
     )
     @app_commands.guild_only()
-    async def complete(self, interaction: discord.Interaction) -> None:
-        await self._finish_successful_order(interaction)
+    @app_commands.describe(
+        legacy_total="Older unrecognized ticket only: verified total after taxes and fees",
+        customer="Older ticket only: customer if the channel topic does not identify them",
+    )
+    async def complete(
+        self,
+        interaction: discord.Interaction,
+        legacy_total: str | None = None,
+        customer: discord.Member | None = None,
+    ) -> None:
+        await self._finish_successful_order(
+            interaction,
+            legacy_total=legacy_total,
+            customer=customer,
+        )
 
     @app_commands.command(name="close", description="Save the transcript and close this ticket")
     @app_commands.guild_only()

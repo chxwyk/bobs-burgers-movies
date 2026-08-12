@@ -186,6 +186,30 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotEqual(next_order.id, order.id)
 
+    async def test_import_legacy_ticket_can_complete_and_track_12_percent(self) -> None:
+        imported = await self.db.import_legacy_ticket(
+            guild_id=1,
+            customer_id=40,
+            channel_id=300,
+            movie_showtime="Recovered legacy ticket: movie-0002-customer",
+            submitted_total_cents=4200,
+            assigned_staff_id=20,
+        )
+        self.assertEqual(imported.channel_id, 300)
+        self.assertEqual(imported.status, "tickets_sent")
+        self.assertEqual(imported.submitted_total_cents, 4200)
+
+        completed, recorded, share_cents = await self.db.complete_order_with_owner_share(
+            imported.id,
+            guild_id=1,
+            share_percent=12,
+            actor_id=20,
+            scheduled_close_at="2026-08-12T12:00:00+00:00",
+        )
+        self.assertEqual(completed.status, "completed")
+        self.assertTrue(recorded)
+        self.assertEqual(share_cents, 504)
+
 
 if __name__ == "__main__":
     unittest.main()

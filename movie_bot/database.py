@@ -409,6 +409,79 @@ class Database:
         async with self._write_lock:
             return await self._run(operation)
 
+    async def import_legacy_ticket(
+        self,
+        *,
+        guild_id: int,
+        customer_id: int,
+        channel_id: int,
+        movie_showtime: str,
+        submitted_total_cents: int,
+        assigned_staff_id: int,
+    ) -> MovieOrder:
+        """Recover an older movie ticket whose database row was lost."""
+        now = _now()
+        customer_price = discounted_price_cents(submitted_total_cents)
+
+        def operation() -> MovieOrder:
+            try:
+                with self._connect() as connection:
+                    existing_channel = connection.execute(
+                        "SELECT * FROM movie_orders WHERE channel_id = ?", (channel_id,)
+                    ).fetchone()
+                    if existing_channel is not None:
+                        order = _order_from_row(existing_channel)
+                        assert order is not None
+                        return order
+
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO movie_orders (
+                            guild_id, customer_id, channel_id, movie_showtime, zip_code,
+                            seats, snacks, submitted_total_cents, customer_price_cents,
+                            discount_basis_points, assigned_staff_id, status,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, '00000', 1, 'Legacy ticket recovery',
+                                  ?, ?, ?, ?, 'tickets_sent', ?, ?)
+                        """,
+                        (
+                            guild_id,
+                            customer_id,
+                            channel_id,
+                            movie_showtime,
+                            submitted_total_cents,
+                            customer_price,
+                            DEFAULT_DISCOUNT_BASIS_POINTS,
+                            assigned_staff_id,
+                            now,
+                            now,
+                        ),
+                    )
+                    row = connection.execute(
+                        "SELECT * FROM movie_orders WHERE id = ?", (cursor.lastrowid,)
+                    ).fetchone()
+            except sqlite3.IntegrityError as exc:
+                text = str(exc)
+                if (
+                    "one_active_movie_order_per_customer" in text
+                    or "movie_orders.guild_id, movie_orders.customer_id" in text
+                ):
+                    raise ActiveOrderExistsError from exc
+                raise
+            order = _order_from_row(row)
+            assert order is not None
+            return order
+
+        async with self._write_lock:
+            order = await self._run(operation)
+        await self.add_event(
+            order.id,
+            "legacy_ticket_recovered",
+            actor_id=assigned_staff_id,
+            details={"channel_id": channel_id, "submitted_total_cents": submitted_total_cents},
+        )
+        return order
+
     async def attach_channel(self, order_id: int, channel_id: int) -> MovieOrder:
         def operation() -> MovieOrder:
             with self._connect() as connection:

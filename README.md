@@ -69,6 +69,17 @@ to be confirmed with `/paid` first
 so cancelled or unpaid orders cannot be counted accidentally. Customers do not see
 the owner-share calculation.
 
+For an older ticket that says it is not recognized, recover it inside that channel:
+
+```text
+/complete legacy_total:42
+```
+
+The bot reads the customer ID from the older channel topic, reconnects the channel,
+records `$5.04` at 12%, and starts its 12-hour closing timer. If the topic does not
+contain a customer ID, use `/complete legacy_total:42 customer:@Customer`. Do not
+enter `legacy_total` on normal recognized tickets.
+
 Use `/close` for cancelled, duplicate, or unfinished tickets. It saves the
 transcript without recording earnings.
 
