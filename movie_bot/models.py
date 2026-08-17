@@ -51,6 +51,19 @@ class PaymentMethod:
 @dataclass(frozen=True, slots=True)
 class OwnerShareSummary:
     owed_order_count: int
+    owed_revenue_cents: int
     owed_cents: int
     lifetime_order_count: int
+    lifetime_revenue_cents: int
+    lifetime_cents: int
+
+
+@dataclass(frozen=True, slots=True)
+class StaffOwnerShareSummary:
+    staff_user_id: int
+    owed_order_count: int
+    owed_revenue_cents: int
+    owed_cents: int
+    lifetime_order_count: int
+    lifetime_revenue_cents: int
     lifetime_cents: int

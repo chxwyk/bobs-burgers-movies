@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -115,6 +116,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             guild_id=1,
             share_percent=12,
             actor_id=20,
+            owed_by_staff_id=25,
             reason="Completed",
         )
         _, second_recorded, second_share = await self.db.close_order_with_owner_share(
@@ -122,19 +124,27 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             guild_id=1,
             share_percent=12,
             actor_id=20,
+            owed_by_staff_id=25,
             reason="Duplicate completion",
         )
 
         self.assertEqual(closed.status, "closed")
         self.assertTrue(first_recorded)
         self.assertFalse(second_recorded)
-        self.assertEqual(first_share, 1440)
-        self.assertEqual(second_share, 1440)
+        self.assertEqual(first_share, 720)
+        self.assertEqual(second_share, 720)
         summary = await self.db.get_owner_share_summary(1)
         self.assertEqual(summary.owed_order_count, 1)
-        self.assertEqual(summary.owed_cents, 1440)
+        self.assertEqual(summary.owed_revenue_cents, 6000)
+        self.assertEqual(summary.owed_cents, 720)
         self.assertEqual(summary.lifetime_order_count, 1)
-        self.assertEqual(summary.lifetime_cents, 1440)
+        self.assertEqual(summary.lifetime_revenue_cents, 6000)
+        self.assertEqual(summary.lifetime_cents, 720)
+        by_staff = await self.db.get_owner_share_summary_by_staff(1)
+        self.assertEqual(len(by_staff), 1)
+        self.assertEqual(by_staff[0].staff_user_id, 25)
+        self.assertEqual(by_staff[0].owed_revenue_cents, 6000)
+        self.assertEqual(by_staff[0].owed_cents, 720)
 
     async def test_complete_records_share_and_schedules_close_without_closing(self) -> None:
         order = await self.db.create_order(
@@ -154,6 +164,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             guild_id=1,
             share_percent=12,
             actor_id=20,
+            owed_by_staff_id=20,
             scheduled_close_at=scheduled_close_at,
         )
         repeated, second_recorded, second_share = await self.db.complete_order_with_owner_share(
@@ -161,6 +172,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             guild_id=1,
             share_percent=12,
             actor_id=20,
+            owed_by_staff_id=20,
             scheduled_close_at="2026-08-13T12:00:00+00:00",
         )
 
@@ -169,11 +181,11 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repeated.scheduled_close_at, scheduled_close_at)
         self.assertTrue(first_recorded)
         self.assertFalse(second_recorded)
-        self.assertEqual(first_share, 504)
-        self.assertEqual(second_share, 504)
+        self.assertEqual(first_share, 252)
+        self.assertEqual(second_share, 252)
         pending = await self.db.get_pending_scheduled_closures()
         self.assertEqual([item.id for item in pending], [order.id])
-        self.assertEqual(await self.db.get_owner_share_for_order(order.id), (12, 504))
+        self.assertEqual(await self.db.get_owner_share_for_order(order.id), (12, 252))
 
         next_order = await self.db.create_order(
             guild_id=1,
@@ -204,11 +216,49 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             guild_id=1,
             share_percent=12,
             actor_id=20,
+            owed_by_staff_id=20,
             scheduled_close_at="2026-08-12T12:00:00+00:00",
         )
         self.assertEqual(completed.status, "completed")
         self.assertTrue(recorded)
-        self.assertEqual(share_cents, 504)
+        self.assertEqual(share_cents, 252)
+
+    async def test_initialize_repairs_historical_shares_to_use_customer_price(self) -> None:
+        order = await self.db.create_order(
+            guild_id=1,
+            customer_id=41,
+            movie_showtime="Historical Movie — 7:00 PM",
+            zip_code="89109",
+            seats=2,
+            snacks="None",
+            submitted_total_cents=4092,
+        )
+        order = await self.db.attach_channel(order.id, 301)
+        await self.db.complete_order_with_owner_share(
+            order.id,
+            guild_id=1,
+            share_percent=12,
+            actor_id=20,
+            owed_by_staff_id=20,
+            scheduled_close_at="2026-08-12T12:00:00+00:00",
+        )
+
+        # Simulate a row written by the old release from the left-side total.
+        with sqlite3.connect(self.db.path) as connection:
+            connection.execute(
+                """
+                UPDATE owner_shares
+                SET order_total_cents = 4092, share_cents = 491
+                WHERE order_id = ?
+                """,
+                (order.id,),
+            )
+
+        await self.db.initialize()
+        self.assertEqual(await self.db.get_owner_share_for_order(order.id), (12, 246))
+        summary = await self.db.get_owner_share_summary(1)
+        self.assertEqual(summary.lifetime_revenue_cents, 2046)
+        self.assertEqual(summary.lifetime_cents, 246)
 
 
 if __name__ == "__main__":

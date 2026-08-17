@@ -12,10 +12,13 @@ rebuilt strictly for movie tickets.
 - Creates one private ticket visible only to the customer, Movie Staff, and the bot
 - Automatically pings the configured Movie Staff role when a new ticket opens
 - Staff claim, invoice, payment confirmation, QR-ticket delivery, completion, and closure
-- One-command `/complete` flow that immediately calculates and records the owner's 12% share
-- Completed tickets remain available to customers for 12 hours, then the bot saves
-  the final transcript and deletes the ticket automatically—even after a Railway restart
-- Duplicate-safe earnings ledger plus administrator-only `/earnings` totals
+- `/complete` and `/done` record the owner's 12% share under the claiming Movie Staff member
+- `/complete` closes immediately; `/done` gives the customer one hour to save their
+  ticket information before the bot archives and deletes the channel—even after a Railway restart
+- The 12% uses the customer's 50%-off price shown on the right, never the original
+  checkout total shown on the left
+- Duplicate-safe earnings ledger with repaired historical totals, customer revenue,
+  owner profit/share, and per-staff breakdown
 - Each Movie Staff member can configure their own payment methods
 - Red **Close Ticket** button plus `/close`
 - Saves an HTML transcript before deleting a closed ticket
@@ -39,10 +42,11 @@ access theater accounts, bypass checkout systems, or automatically verify paymen
 5. Movie Staff verifies the screenshot and sends the exact 50%-off invoice.
 6. Choose a payment method, pay, select **I've Paid**, and upload proof.
 7. Movie Staff posts the QR ticket codes and any AMC snack pickup information.
-8. Movie Staff runs `/complete`; the bot automatically uses the saved verified
-   total and immediately records the owner's 12% share.
-9. The customer has 12 hours to save QR codes, links, and pickup information.
-   The bot then saves the final transcript and closes the ticket automatically.
+8. Movie Staff runs `/complete` for an immediate close or `/done` for a one-hour
+   customer access window. Both commands immediately record the owner's 12% share
+   as owed by the claimant.
+9. The 12% is calculated from the customer's 50%-off price on the right side of
+   the order summary. The bot then saves the final transcript and closes automatically.
 
 ## Staff commands
 
@@ -53,21 +57,20 @@ access theater accounts, bypass checkout systems, or automatically verify paymen
 /paid
 /tickets_sent details:QR codes attached. AMC snacks are under the customer's name.
 /complete
-/done (backup alias for /complete)
+/done
 /close reason:Tickets delivered successfully
 /order_info
 ```
 
-`/complete` requires no amount and no manual calculation. It uses the checkout
-total submitted in the order form, or the corrected total previously saved with
-`/pay final_total:`. For example, a saved `$120.00` order total automatically
-records `$14.40` as the owner's 12% share. It records each order only once and
-immediately adds the calculation to `/earnings`. The ticket remains open for 12
-hours; the bot then saves the customer-safe transcript and deletes the channel.
-Scheduled closures are restored after Railway restarts. The bot requires payment
-to be confirmed with `/paid` first
-so cancelled or unpaid orders cannot be counted accidentally. Customers do not see
-the owner-share calculation.
+Both completion commands require no amount and no manual calculation. The bot uses
+the checkout total submitted in the order form, or the corrected total saved with
+`/pay final_total:`, calculates the customer's 50%-off price, then records 12% of
+that right-side customer price. For example, a `$120.00` checkout produces a
+`$60.00` customer price and a `$7.20` owner share owed by the claiming Movie Staff
+member. Each order is counted once and immediately appears in `/earnings`.
+`/complete` archives immediately; `/done` keeps the channel available for one hour.
+Scheduled closures survive Railway restarts. Payment must be confirmed with `/paid`
+first, and customers never see the owner-share calculation.
 
 For an older ticket that says it is not recognized, recover it inside that channel:
 
@@ -76,9 +79,10 @@ For an older ticket that says it is not recognized, recover it inside that chann
 ```
 
 The bot reads the customer ID from the older channel topic, reconnects the channel,
-records `$5.04` at 12%, and starts its 12-hour closing timer. If the topic does not
-contain a customer ID, use `/complete legacy_total:42 customer:@Customer`. Do not
-enter `legacy_total` on normal recognized tickets.
+records `$2.52` at 12% of the `$21.00` customer price, and closes immediately. If
+the topic does not contain a customer ID, use
+`/complete legacy_total:42 customer:@Customer`. Do not enter `legacy_total` on
+normal recognized tickets.
 
 Use `/close` for cancelled, duplicate, or unfinished tickets. It saves the
 transcript without recording earnings.
@@ -88,6 +92,10 @@ Administrators can view the running total with:
 ```text
 /earnings
 ```
+
+On the first startup after this update, the bot automatically recalculates every
+older ledger entry from the right-side customer price. `/earnings` then shows the
+corrected lifetime customer revenue, owner profit/share, and claimant balances.
 
 Payment setup is separate for each Movie Staff member:
 

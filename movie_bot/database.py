@@ -8,7 +8,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
-from .models import GuildSettings, MovieOrder, OwnerShareSummary, PaymentMethod
+from .models import (
+    GuildSettings,
+    MovieOrder,
+    OwnerShareSummary,
+    PaymentMethod,
+    StaffOwnerShareSummary,
+)
 from .pricing import (
     DEFAULT_DISCOUNT_BASIS_POINTS,
     discounted_price_cents,
@@ -92,6 +98,7 @@ CREATE TABLE IF NOT EXISTS owner_shares (
     share_cents INTEGER NOT NULL CHECK (share_cents > 0),
     status TEXT NOT NULL DEFAULT 'owed' CHECK (status IN ('owed', 'paid')),
     recorded_by INTEGER NOT NULL,
+    owed_by_staff_id INTEGER,
     recorded_at TEXT NOT NULL,
     settled_by INTEGER,
     settled_at TEXT,
@@ -210,8 +217,53 @@ class Database:
                     connection.execute(
                         "ALTER TABLE movie_orders ADD COLUMN completed_by INTEGER"
                     )
-                # Completed tickets remain visible for 12 hours, but they must not
-                # prevent the customer from creating a new movie order.
+                share_columns = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        "PRAGMA table_info(owner_shares)"
+                    ).fetchall()
+                }
+                if "owed_by_staff_id" not in share_columns:
+                    connection.execute(
+                        "ALTER TABLE owner_shares ADD COLUMN owed_by_staff_id INTEGER"
+                    )
+                connection.execute(
+                    """
+                    UPDATE owner_shares
+                    SET owed_by_staff_id = COALESCE(
+                        owed_by_staff_id,
+                        (SELECT assigned_staff_id FROM movie_orders
+                         WHERE movie_orders.id = owner_shares.order_id),
+                        recorded_by
+                    )
+                    WHERE owed_by_staff_id IS NULL
+                    """
+                )
+                # The owner earns a percentage of what the customer actually pays
+                # (the right-side 50%-off price), not the original checkout total.
+                # Recalculate every saved row so historical earnings and revenue
+                # summaries are corrected automatically on the first new startup.
+                connection.execute(
+                    """
+                    UPDATE owner_shares
+                    SET order_total_cents = (
+                            SELECT customer_price_cents
+                            FROM movie_orders
+                            WHERE movie_orders.id = owner_shares.order_id
+                        ),
+                        share_cents = (
+                            SELECT (customer_price_cents * owner_shares.share_percent + 50) / 100
+                            FROM movie_orders
+                            WHERE movie_orders.id = owner_shares.order_id
+                        )
+                    WHERE EXISTS (
+                        SELECT 1 FROM movie_orders
+                        WHERE movie_orders.id = owner_shares.order_id
+                    )
+                    """
+                )
+                # Completed tickets remain visible during their access window, but
+                # they must not prevent the customer from creating a new movie order.
                 connection.execute("DROP INDEX IF EXISTS one_active_movie_order_per_customer")
                 connection.execute(
                     """
@@ -667,6 +719,7 @@ class Database:
         guild_id: int,
         share_percent: int,
         actor_id: int,
+        owed_by_staff_id: int,
         reason: str,
     ) -> tuple[MovieOrder, bool, int]:
         now = _now()
@@ -674,7 +727,7 @@ class Database:
         def operation() -> tuple[MovieOrder, bool, int]:
             with self._connect() as connection:
                 existing = connection.execute(
-                    "SELECT guild_id, submitted_total_cents FROM movie_orders WHERE id = ?",
+                    "SELECT guild_id, customer_price_cents FROM movie_orders WHERE id = ?",
                     (order_id,),
                 ).fetchone()
                 if existing is None:
@@ -682,14 +735,14 @@ class Database:
                 if int(existing["guild_id"]) != guild_id:
                     raise ValueError("Movie order does not belong to this Discord server.")
 
-                order_total_cents = int(existing["submitted_total_cents"])
+                order_total_cents = int(existing["customer_price_cents"])
                 share_cents = percentage_share_cents(order_total_cents, share_percent)
                 cursor = connection.execute(
                     """
                     INSERT OR IGNORE INTO owner_shares (
                         order_id, guild_id, order_total_cents, share_percent,
-                        share_cents, status, recorded_by, recorded_at
-                    ) VALUES (?, ?, ?, ?, ?, 'owed', ?, ?)
+                        share_cents, status, recorded_by, owed_by_staff_id, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, 'owed', ?, ?, ?)
                     """,
                     (
                         order_id,
@@ -698,6 +751,7 @@ class Database:
                         share_percent,
                         share_cents,
                         actor_id,
+                        owed_by_staff_id,
                         now,
                     ),
                 )
@@ -723,9 +777,10 @@ class Database:
                         json.dumps(
                             {
                                 "reason": reason,
-                                "order_total_cents": order_total_cents,
+                                "customer_price_cents": order_total_cents,
                                 "owner_share_percent": share_percent,
                                 "owner_share_cents": share_cents,
+                                "owed_by_staff_id": owed_by_staff_id,
                                 "share_recorded": share_recorded,
                             },
                             separators=(",", ":"),
@@ -752,6 +807,7 @@ class Database:
         guild_id: int,
         share_percent: int,
         actor_id: int,
+        owed_by_staff_id: int,
         scheduled_close_at: str,
     ) -> tuple[MovieOrder, bool, int]:
         """Record the owner share and schedule closure without closing the ticket."""
@@ -761,7 +817,7 @@ class Database:
             with self._connect() as connection:
                 existing = connection.execute(
                     """
-                    SELECT guild_id, submitted_total_cents, status, scheduled_close_at
+                    SELECT guild_id, customer_price_cents, status, scheduled_close_at
                     FROM movie_orders WHERE id = ?
                     """,
                     (order_id,),
@@ -773,14 +829,14 @@ class Database:
                 if str(existing["status"]) in {"closed", "cancelled"}:
                     raise ValueError("Movie order is already closed.")
 
-                order_total_cents = int(existing["submitted_total_cents"])
+                order_total_cents = int(existing["customer_price_cents"])
                 share_cents = percentage_share_cents(order_total_cents, share_percent)
                 cursor = connection.execute(
                     """
                     INSERT OR IGNORE INTO owner_shares (
                         order_id, guild_id, order_total_cents, share_percent,
-                        share_cents, status, recorded_by, recorded_at
-                    ) VALUES (?, ?, ?, ?, ?, 'owed', ?, ?)
+                        share_cents, status, recorded_by, owed_by_staff_id, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, 'owed', ?, ?, ?)
                     """,
                     (
                         order_id,
@@ -789,6 +845,7 @@ class Database:
                         share_percent,
                         share_cents,
                         actor_id,
+                        owed_by_staff_id,
                         now,
                     ),
                 )
@@ -814,9 +871,10 @@ class Database:
                         actor_id,
                         json.dumps(
                             {
-                                "order_total_cents": order_total_cents,
+                                "customer_price_cents": order_total_cents,
                                 "owner_share_percent": share_percent,
                                 "owner_share_cents": share_cents,
+                                "owed_by_staff_id": owed_by_staff_id,
                                 "share_recorded": share_recorded,
                                 "scheduled_close_at": effective_close_at,
                             },
@@ -876,9 +934,14 @@ class Database:
                     """
                     SELECT
                         COUNT(*) AS lifetime_order_count,
+                        COALESCE(SUM(order_total_cents), 0) AS lifetime_revenue_cents,
                         COALESCE(SUM(share_cents), 0) AS lifetime_cents,
                         COALESCE(SUM(CASE WHEN status = 'owed' THEN 1 ELSE 0 END), 0)
                             AS owed_order_count,
+                        COALESCE(
+                            SUM(CASE WHEN status = 'owed' THEN order_total_cents ELSE 0 END),
+                            0
+                        ) AS owed_revenue_cents,
                         COALESCE(SUM(CASE WHEN status = 'owed' THEN share_cents ELSE 0 END), 0)
                             AS owed_cents
                     FROM owner_shares
@@ -889,10 +952,54 @@ class Database:
                 assert row is not None
                 return OwnerShareSummary(
                     owed_order_count=int(row["owed_order_count"]),
+                    owed_revenue_cents=int(row["owed_revenue_cents"]),
                     owed_cents=int(row["owed_cents"]),
                     lifetime_order_count=int(row["lifetime_order_count"]),
+                    lifetime_revenue_cents=int(row["lifetime_revenue_cents"]),
                     lifetime_cents=int(row["lifetime_cents"]),
                 )
+
+        return await self._run(operation)
+
+    async def get_owner_share_summary_by_staff(
+        self, guild_id: int
+    ) -> list[StaffOwnerShareSummary]:
+        def operation() -> list[StaffOwnerShareSummary]:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        owed_by_staff_id AS staff_user_id,
+                        COUNT(*) AS lifetime_order_count,
+                        COALESCE(SUM(order_total_cents), 0) AS lifetime_revenue_cents,
+                        COALESCE(SUM(share_cents), 0) AS lifetime_cents,
+                        COALESCE(SUM(CASE WHEN status = 'owed' THEN 1 ELSE 0 END), 0)
+                            AS owed_order_count,
+                        COALESCE(
+                            SUM(CASE WHEN status = 'owed' THEN order_total_cents ELSE 0 END),
+                            0
+                        ) AS owed_revenue_cents,
+                        COALESCE(SUM(CASE WHEN status = 'owed' THEN share_cents ELSE 0 END), 0)
+                            AS owed_cents
+                    FROM owner_shares
+                    WHERE guild_id = ? AND owed_by_staff_id IS NOT NULL
+                    GROUP BY owed_by_staff_id
+                    ORDER BY owed_cents DESC, owed_by_staff_id
+                    """,
+                    (guild_id,),
+                ).fetchall()
+                return [
+                    StaffOwnerShareSummary(
+                        staff_user_id=int(row["staff_user_id"]),
+                        owed_order_count=int(row["owed_order_count"]),
+                        owed_revenue_cents=int(row["owed_revenue_cents"]),
+                        owed_cents=int(row["owed_cents"]),
+                        lifetime_order_count=int(row["lifetime_order_count"]),
+                        lifetime_revenue_cents=int(row["lifetime_revenue_cents"]),
+                        lifetime_cents=int(row["lifetime_cents"]),
+                    )
+                    for row in rows
+                ]
 
         return await self._run(operation)
 

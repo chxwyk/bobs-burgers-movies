@@ -40,7 +40,8 @@ PURPLE = discord.Color.from_rgb(145, 70, 255)
 SUCCESS = discord.Color.from_rgb(46, 204, 113)
 WARNING = discord.Color.from_rgb(241, 196, 15)
 ERROR = discord.Color.from_rgb(231, 76, 60)
-COMPLETED_TICKET_RETENTION = timedelta(hours=12)
+COMPLETE_TICKET_RETENTION = timedelta(seconds=5)
+DONE_TICKET_RETENTION = timedelta(hours=1)
 SCHEDULED_CLOSE_RETRY_SECONDS = 5 * 60
 KNOWN_PAYMENT_METHODS = (
     "Cash App",
@@ -229,7 +230,7 @@ def _order_summary_embed(order: MovieOrder) -> discord.Embed:
     )
     embed.add_field(
         name="Estimated 50%-Off Price",
-        value=format_cents(order.customer_price_cents),
+        value=f"**{format_cents(order.customer_price_cents)}**",
         inline=True,
     )
     embed.set_footer(text="Food and drinks are available for AMC orders only.")
@@ -749,7 +750,7 @@ async def _close_ticket(
         messages = await _collect_transcript_messages(interaction.channel)
         archived_order = replace(order, status="completed") if owner_share_percent else order
         calculated_share_cents = (
-            percentage_share_cents(order.submitted_total_cents, owner_share_percent)
+            percentage_share_cents(order.customer_price_cents, owner_share_percent)
             if owner_share_percent is not None
             else None
         )
@@ -782,8 +783,8 @@ async def _close_ticket(
         if owner_share_percent is not None:
             assert calculated_share_cents is not None
             log_embed.add_field(
-                name="Verified Order Total",
-                value=format_cents(order.submitted_total_cents),
+                name="Customer Price — Share Base",
+                value=format_cents(order.customer_price_cents),
                 inline=True,
             )
             log_embed.add_field(
@@ -818,6 +819,7 @@ async def _close_ticket(
                     guild_id=interaction.guild.id,
                     share_percent=owner_share_percent,
                     actor_id=interaction.user.id,
+                    owed_by_staff_id=order.assigned_staff_id or interaction.user.id,
                     reason=reason,
                 )
                 assert calculated_share_cents == recorded_share_cents
@@ -926,7 +928,7 @@ async def _archive_completed_movie_order(bot: MovieOrdersBot, order_id: int) -> 
         share = await bot.db.get_owner_share_for_order(order.id)
         log_embed = discord.Embed(
             title=f"🎬 Movie Order #{order.id:06d} Auto-Closed",
-            description="The 12-hour customer access window ended.",
+            description="The customer access window ended.",
             color=discord.Color.dark_grey(),
         )
         log_embed.add_field(name="Customer", value=f"<@{order.customer_id}>", inline=True)
@@ -936,6 +938,11 @@ async def _archive_completed_movie_order(bot: MovieOrdersBot, order_id: int) -> 
             value=format_cents(order.submitted_total_cents),
             inline=True,
         )
+        log_embed.add_field(
+            name="Customer Price — Share Base",
+            value=format_cents(order.customer_price_cents),
+            inline=True,
+        )
         if share is not None:
             share_percent, share_cents = share
             log_embed.add_field(
@@ -943,7 +950,7 @@ async def _archive_completed_movie_order(bot: MovieOrdersBot, order_id: int) -> 
                 value=f"**{format_cents(share_cents)}**",
                 inline=True,
             )
-        log_embed.set_footer(text="Transcript captured after the 12-hour access window.")
+        log_embed.set_footer(text="Transcript captured after the customer access window.")
         try:
             await log_channel.send(
                 embed=log_embed,
@@ -958,20 +965,20 @@ async def _archive_completed_movie_order(bot: MovieOrdersBot, order_id: int) -> 
         if customer is not None:
             with contextlib.suppress(discord.Forbidden, discord.HTTPException):
                 await customer.send(
-                    content=f"Your movie order #{order.id:06d} was closed after 12 hours.",
+                    content=f"Your movie order #{order.id:06d} was closed.",
                     file=discord.File(transcript_path),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
 
         with contextlib.suppress(discord.Forbidden, discord.HTTPException):
             await channel.send(
-                "🔒 The 12-hour access window has ended. Transcript saved; closing "
+                "🔒 The customer access window has ended. Transcript saved; closing "
                 "this ticket in 5 seconds.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         await asyncio.sleep(5)
         try:
-            await channel.delete(reason=f"Movie order #{order.id:06d} 12-hour window ended")
+            await channel.delete(reason=f"Movie order #{order.id:06d} access window ended")
         except (discord.Forbidden, discord.HTTPException):
             LOGGER.exception("Could not delete scheduled movie ticket %s", channel.id)
             return False
@@ -979,7 +986,7 @@ async def _archive_completed_movie_order(bot: MovieOrdersBot, order_id: int) -> 
             order.id,
             "closed",
             actor_id=order.completed_by,
-            details={"reason": "12-hour completed-ticket access window ended"},
+            details={"reason": "Completed-ticket customer access window ended"},
         )
         return True
     finally:
@@ -1464,7 +1471,9 @@ class MovieCommands(commands.Cog):
         if not _is_staff(interaction.user, settings):
             await _ephemeral(interaction, "Only Movie Staff can confirm payments.")
             return
-        if order.assigned_staff_id not in {None, interaction.user.id}:
+        if order.assigned_staff_id not in {None, interaction.user.id} and not _is_administrator(
+            interaction.user
+        ):
             await _ephemeral(
                 interaction,
                 f"This order is assigned to <@{order.assigned_staff_id}>.",
@@ -1517,7 +1526,11 @@ class MovieCommands(commands.Cog):
             color=SUCCESS,
         )
         embed.set_footer(
-            text="Confirm the movie, theater, date, showtime, and seat details before leaving."
+            text=(
+                "Confirm the movie, theater, date, showtime, and seats. Movie Staff: "
+                "run /done after delivery to record the owner's share and start the "
+                "one-hour access window."
+            )
         )
         await interaction.response.send_message(
             content=f"<@{order.customer_id}>",
@@ -1531,6 +1544,7 @@ class MovieCommands(commands.Cog):
         self,
         interaction: discord.Interaction,
         *,
+        retention: timedelta,
         legacy_total: str | None = None,
         customer: discord.Member | None = None,
     ) -> None:
@@ -1621,19 +1635,20 @@ class MovieCommands(commands.Cog):
         if order.status not in {"paid", "tickets_sent"}:
             await _ephemeral(
                 interaction,
-                "Confirm the customer's payment with `/paid` before using `/done`.",
+                "Confirm the customer's payment with `/paid` before completing the order.",
             )
             return
         if order.assigned_staff_id is None:
             order = await self.bot.db.assign_order(order.id, interaction.user.id)
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        requested_close_at = discord.utils.utcnow() + COMPLETED_TICKET_RETENTION
+        requested_close_at = discord.utils.utcnow() + retention
         order, share_recorded, share_cents = await self.bot.db.complete_order_with_owner_share(
             order.id,
             guild_id=interaction.guild.id,
             share_percent=self.bot.settings.owner_share_percent,
             actor_id=interaction.user.id,
+            owed_by_staff_id=order.assigned_staff_id or interaction.user.id,
             scheduled_close_at=requested_close_at.isoformat(),
         )
         assert order.scheduled_close_at is not None
@@ -1641,14 +1656,25 @@ class MovieCommands(commands.Cog):
         close_timestamp = int(close_at.timestamp())
         self.bot.schedule_completed_order(order.id, order.scheduled_close_at)
 
+        closes_immediately = retention <= COMPLETE_TICKET_RETENTION
+        window_title = "Closing Now" if closes_immediately else "One-Hour Access Window"
+        window_description = (
+            "Your order is complete. The final transcript is being saved and this "
+            "ticket will close now."
+            if closes_immediately
+            else (
+                "Your order is complete. This ticket will remain available for "
+                "**one hour** so you can save your ticket links, QR codes, and pickup "
+                "information."
+            )
+        )
+
         await interaction.channel.send(
             content=f"<@{order.customer_id}>",
             embed=discord.Embed(
-                title="✅ Movie Order Completed",
+                title=f"✅ Movie Order Completed — {window_title}",
                 description=(
-                    "Your order is complete. This ticket will remain available for "
-                    "**12 hours** so you can save your ticket links, QR codes, and pickup "
-                    "information.\n\n"
+                    f"{window_description}\n\n"
                     f"**Automatic close:** <t:{close_timestamp}:F> "
                     f"(<t:{close_timestamp}:R>)"
                 ),
@@ -1659,25 +1685,30 @@ class MovieCommands(commands.Cog):
         share_status = "recorded" if share_recorded else "was already recorded"
         await interaction.followup.send(
             (
-                f"Completed. Verified total: **{format_cents(order.submitted_total_cents)}**. "
+                "Completed. Customer price (right-side total): "
+                f"**{format_cents(order.customer_price_cents)}**. "
                 f"Your {self.bot.settings.owner_share_percent}% share is "
                 f"**{format_cents(share_cents)}** and {share_status}. The ticket will "
-                f"close automatically <t:{close_timestamp}:R>."
+                f"close <t:{close_timestamp}:R>. Owed by Movie Staff: "
+                f"<@{order.assigned_staff_id or interaction.user.id}>."
             ),
             ephemeral=True,
         )
 
     @app_commands.command(
         name="done",
-        description="Alias for /complete: record 12% and schedule the 12-hour close",
+        description="Record 12% and keep the completed ticket open for one hour",
     )
     @app_commands.guild_only()
     async def done(self, interaction: discord.Interaction) -> None:
-        await self._finish_successful_order(interaction)
+        await self._finish_successful_order(
+            interaction,
+            retention=DONE_TICKET_RETENTION,
+        )
 
     @app_commands.command(
         name="complete",
-        description="Record the owner's 12% share and close the ticket after 12 hours",
+        description="Record the owner's 12% share and close the ticket immediately",
     )
     @app_commands.guild_only()
     @app_commands.describe(
@@ -1692,6 +1723,7 @@ class MovieCommands(commands.Cog):
     ) -> None:
         await self._finish_successful_order(
             interaction,
+            retention=COMPLETE_TICKET_RETENTION,
             legacy_total=legacy_total,
             customer=customer,
         )
@@ -1720,6 +1752,9 @@ class MovieCommands(commands.Cog):
             return
 
         summary = await self.bot.db.get_owner_share_summary(interaction.guild_id)
+        staff_summaries = await self.bot.db.get_owner_share_summary_by_staff(
+            interaction.guild_id
+        )
         embed = discord.Embed(
             title="🎬 Movie Order Owner Share",
             description=(
@@ -1730,17 +1765,40 @@ class MovieCommands(commands.Cog):
         )
         embed.add_field(
             name="Automatic Rate",
-            value=f"{self.bot.settings.owner_share_percent}% of the verified order total",
+            value=(
+                f"{self.bot.settings.owner_share_percent}% of the customer's 50%-off "
+                "price (the right-side total)"
+            ),
             inline=False,
         )
         embed.add_field(
-            name="Lifetime Recorded",
+            name="Lifetime Customer Revenue",
+            value=(
+                f"{format_cents(summary.lifetime_revenue_cents)} across "
+                f"{summary.lifetime_order_count} order(s)"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Lifetime Owner Profit / Share",
             value=(
                 f"{format_cents(summary.lifetime_cents)} across "
                 f"{summary.lifetime_order_count} order(s)"
             ),
-            inline=False,
+            inline=True,
         )
+        if staff_summaries:
+            embed.add_field(
+                name="Who Owes It",
+                value="\n".join(
+                    f"<@{item.staff_user_id}> — **{format_cents(item.owed_cents)} owed** "
+                    f"from {format_cents(item.owed_revenue_cents)} in customer revenue "
+                    f"({item.owed_order_count} order(s)); "
+                    f"{format_cents(item.lifetime_cents)} lifetime owner share"
+                    for item in staff_summaries
+                )[:1024],
+                inline=False,
+            )
         embed.set_footer(text="Only /done or /complete records earnings. /close does not.")
         await _ephemeral(interaction, embed=embed)
 
