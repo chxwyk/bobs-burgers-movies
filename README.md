@@ -171,17 +171,15 @@ After Railway shows the bot as online, run:
 /setup
 ```
 
-Select:
+The interactive menu lets you choose your **existing** storefront channel, ticket
+category, transcript channel, Movie Staff role, and customer notification role from
+Discord dropdowns. It never creates channels or roles.
 
-- `panel_channel`: public movie storefront channel
-- `ticket_category`: private movie ticket category
-- `transcript_channel`: private transcript channel
-- `movie_staff_role`: optional override; defaults to **Direct Movies Staff**
-- `notification_role`: optional override; defaults to your customer role
-- `brand_name`: optional; defaults to `Oxy Movies • 50% Off`
-- `banner_url`: optional movie storefront artwork URL
-
-The bot posts the complete storefront automatically. Use `/panel` later to refresh it.
+After the first save, `/setup` opens a **Setup Is Already Saved** screen with the
+current choices loaded. Press **Edit Setup** only when you want to change something,
+or **Refresh Storefront** to refresh the existing panel. Saving the same storefront
+refreshes its saved message instead of posting a duplicate. The existing storefront
+name and banner are preserved automatically.
 
 ## 4. Deploy on Railway
 

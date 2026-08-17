@@ -5,7 +5,7 @@ import contextlib
 import hashlib
 import logging
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1077,6 +1077,519 @@ async def _announce_store_open(
     return f"Customer notification sent to {role.mention} in {channel.mention}."
 
 
+@dataclass(slots=True)
+class MovieSetupSelections:
+    panel_channel_id: int | None = None
+    ticket_category_id: int | None = None
+    staff_role_id: int | None = None
+    transcript_channel_id: int | None = None
+    notification_role_id: int | None = None
+
+    @classmethod
+    def from_settings(
+        cls,
+        guild: discord.Guild,
+        settings: GuildSettings | None,
+        default_staff_role_id: int | None,
+        default_notification_role_id: int | None,
+    ) -> MovieSetupSelections:
+        panel_channel_id = settings.panel_channel_id if settings else None
+        if not isinstance(guild.get_channel(panel_channel_id), discord.TextChannel):
+            panel_channel_id = None
+
+        ticket_category_id = settings.ticket_category_id if settings else None
+        if not isinstance(guild.get_channel(ticket_category_id), discord.CategoryChannel):
+            ticket_category_id = None
+
+        transcript_channel_id = settings.log_channel_id if settings else None
+        if not isinstance(guild.get_channel(transcript_channel_id), discord.TextChannel):
+            transcript_channel_id = None
+
+        staff_role_id = settings.staff_role_id if settings else default_staff_role_id
+        staff_role = guild.get_role(staff_role_id) if staff_role_id else None
+        if staff_role is None or staff_role.is_default():
+            staff_role_id = None
+
+        notification_role_id = (
+            settings.notification_role_id
+            if settings and settings.notification_role_id
+            else default_notification_role_id
+        )
+        notification_role = (
+            guild.get_role(notification_role_id) if notification_role_id else None
+        )
+        if notification_role is None or notification_role.is_default():
+            notification_role_id = None
+
+        return cls(
+            panel_channel_id=panel_channel_id,
+            ticket_category_id=ticket_category_id,
+            staff_role_id=staff_role_id,
+            transcript_channel_id=transcript_channel_id,
+            notification_role_id=notification_role_id,
+        )
+
+    def core_complete(self) -> bool:
+        return all(
+            value is not None
+            for value in (
+                self.panel_channel_id,
+                self.ticket_category_id,
+                self.staff_role_id,
+                self.transcript_channel_id,
+            )
+        )
+
+
+def _setup_channel_default(
+    guild: discord.Guild,
+    channel_id: int | None,
+    channel_type: type[discord.abc.GuildChannel],
+) -> list[discord.abc.GuildChannel]:
+    if channel_id is None:
+        return []
+    channel = guild.get_channel(channel_id)
+    return [channel] if isinstance(channel, channel_type) else []
+
+
+def _setup_role_default(guild: discord.Guild, role_id: int | None) -> list[discord.Role]:
+    if role_id is None:
+        return []
+    role = guild.get_role(role_id)
+    return [role] if role is not None and not role.is_default() else []
+
+
+def _movie_setup_summary_embed(
+    guild: discord.Guild,
+    state: MovieSetupSelections,
+    *,
+    step: int,
+) -> discord.Embed:
+    category = guild.get_channel(state.ticket_category_id) if state.ticket_category_id else None
+    if step == 0:
+        title = "✅ Direct Movies Setup Is Already Saved"
+        description = (
+            "Your current channels and roles are loaded below. Nothing needs to be set "
+            "up again. Press **Edit Setup** only when you want to change something."
+        )
+    else:
+        title = f"Direct Movies Setup • Step {step} of 2"
+        description = (
+            "Choose from your **existing** Discord channels and roles. The bot will not "
+            "create anything, and nothing changes until you press **Save Setup**."
+        )
+    embed = discord.Embed(title=title, description=description, color=PURPLE)
+    embed.add_field(
+        name="Storefront Channel",
+        value=f"<#{state.panel_channel_id}>" if state.panel_channel_id else "Not selected",
+        inline=True,
+    )
+    embed.add_field(
+        name="Ticket Category",
+        value=(
+            f"**{category.name}**"
+            if isinstance(category, discord.CategoryChannel)
+            else "Not selected"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Movie Staff Role",
+        value=f"<@&{state.staff_role_id}>" if state.staff_role_id else "Not selected",
+        inline=True,
+    )
+    embed.add_field(
+        name="Transcript Channel",
+        value=(
+            f"<#{state.transcript_channel_id}>"
+            if state.transcript_channel_id
+            else "Not selected"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Customer Notification Role",
+        value=(
+            f"<@&{state.notification_role_id}>"
+            if state.notification_role_id
+            else "Not selected"
+        ),
+        inline=True,
+    )
+    embed.set_footer(text="Your saved storefront name and banner are preserved automatically.")
+    return embed
+
+
+class _MovieSetupChannelSelect(discord.ui.ChannelSelect):
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        state_key: str,
+        channel_type: discord.ChannelType,
+        resolved_type: type[discord.abc.GuildChannel],
+        current_id: int | None,
+        placeholder: str,
+        row: int,
+    ) -> None:
+        super().__init__(
+            custom_id=f"movie_setup_{state_key}",
+            channel_types=[channel_type],
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            required=True,
+            default_values=_setup_channel_default(guild, current_id, resolved_type),
+            row=row,
+        )
+        self.state_key = state_key
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, MovieSetupCoreView):
+            return
+        setattr(view.state, self.state_key, self.values[0].id)
+        await interaction.response.edit_message(
+            embed=_movie_setup_summary_embed(view.guild, view.state, step=1),
+            view=view,
+        )
+
+
+class _MovieSetupRoleSelect(discord.ui.RoleSelect):
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        state_key: str,
+        current_id: int | None,
+        placeholder: str,
+        row: int,
+    ) -> None:
+        super().__init__(
+            custom_id=f"movie_setup_{state_key}",
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            required=True,
+            default_values=_setup_role_default(guild, current_id),
+            row=row,
+        )
+        self.state_key = state_key
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if isinstance(view, MovieSetupCoreView):
+            setattr(view.state, self.state_key, self.values[0].id)
+            step = 1
+        elif isinstance(view, MovieSetupFinishView):
+            setattr(view.state, self.state_key, self.values[0].id)
+            step = 2
+        else:
+            return
+        await interaction.response.edit_message(
+            embed=_movie_setup_summary_embed(view.guild, view.state, step=step),
+            view=view,
+        )
+
+
+class _MovieSetupOwnedView(discord.ui.View):
+    def __init__(
+        self,
+        bot: MovieOrdersBot,
+        guild: discord.Guild,
+        owner_id: int,
+        state: MovieSetupSelections,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.guild = guild
+        self.owner_id = owner_id
+        self.state = state
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await _ephemeral(interaction, "Only the administrator who opened `/setup` can use it.")
+        return False
+
+    async def _cancel(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="Setup Closed",
+                description="Nothing was changed. Your saved setup is still active.",
+                color=WARNING,
+            ),
+            view=None,
+        )
+
+
+class MovieSetupStatusView(_MovieSetupOwnedView):
+    @discord.ui.button(label="Edit Setup", emoji="⚙️", style=discord.ButtonStyle.primary)
+    async def edit_setup(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        edit_view = MovieSetupCoreView(
+            self.bot,
+            self.guild,
+            self.owner_id,
+            self.state,
+        )
+        await interaction.response.edit_message(
+            embed=_movie_setup_summary_embed(self.guild, self.state, step=1),
+            view=edit_view,
+        )
+        self.stop()
+
+    @discord.ui.button(
+        label="Refresh Storefront",
+        emoji="🔄",
+        style=discord.ButtonStyle.success,
+    )
+    async def refresh_storefront(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        settings = await self.bot.db.get_guild_settings(self.guild.id)
+        if settings is None:
+            await _ephemeral(interaction, "No saved setup was found.")
+            return
+        refreshed = await _refresh_saved_panel(self.bot, self.guild, settings)
+        await _ephemeral(
+            interaction,
+            "Storefront refreshed." if refreshed else "The saved storefront message is missing.",
+        )
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary)
+    async def close_menu(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await self._cancel(interaction)
+
+
+class MovieSetupCoreView(_MovieSetupOwnedView):
+    def __init__(
+        self,
+        bot: MovieOrdersBot,
+        guild: discord.Guild,
+        owner_id: int,
+        state: MovieSetupSelections,
+    ) -> None:
+        super().__init__(bot, guild, owner_id, state)
+        self.add_item(
+            _MovieSetupChannelSelect(
+                guild=guild,
+                state_key="panel_channel_id",
+                channel_type=discord.ChannelType.text,
+                resolved_type=discord.TextChannel,
+                current_id=state.panel_channel_id,
+                placeholder="Choose the existing movie storefront channel",
+                row=0,
+            )
+        )
+        self.add_item(
+            _MovieSetupChannelSelect(
+                guild=guild,
+                state_key="ticket_category_id",
+                channel_type=discord.ChannelType.category,
+                resolved_type=discord.CategoryChannel,
+                current_id=state.ticket_category_id,
+                placeholder="Choose the existing movie ticket category",
+                row=1,
+            )
+        )
+        self.add_item(
+            _MovieSetupRoleSelect(
+                guild=guild,
+                state_key="staff_role_id",
+                current_id=state.staff_role_id,
+                placeholder="Choose the existing Movie Staff role",
+                row=2,
+            )
+        )
+        self.add_item(
+            _MovieSetupChannelSelect(
+                guild=guild,
+                state_key="transcript_channel_id",
+                channel_type=discord.ChannelType.text,
+                resolved_type=discord.TextChannel,
+                current_id=state.transcript_channel_id,
+                placeholder="Choose the existing transcript channel",
+                row=3,
+            )
+        )
+
+    @discord.ui.button(label="Continue", style=discord.ButtonStyle.primary, row=4)
+    async def continue_setup(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        if not self.state.core_complete():
+            await _ephemeral(interaction, "Select all four saved setup items first.")
+            return
+        next_view = MovieSetupFinishView(
+            self.bot,
+            self.guild,
+            self.owner_id,
+            self.state,
+        )
+        await interaction.response.edit_message(
+            embed=_movie_setup_summary_embed(self.guild, self.state, step=2),
+            view=next_view,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=4)
+    async def cancel_setup(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await self._cancel(interaction)
+
+
+class MovieSetupFinishView(_MovieSetupOwnedView):
+    def __init__(
+        self,
+        bot: MovieOrdersBot,
+        guild: discord.Guild,
+        owner_id: int,
+        state: MovieSetupSelections,
+    ) -> None:
+        super().__init__(bot, guild, owner_id, state)
+        self.add_item(
+            _MovieSetupRoleSelect(
+                guild=guild,
+                state_key="notification_role_id",
+                current_id=state.notification_role_id,
+                placeholder="Choose the existing customer notification role",
+                row=0,
+            )
+        )
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, row=1)
+    async def back(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        previous_view = MovieSetupCoreView(
+            self.bot,
+            self.guild,
+            self.owner_id,
+            self.state,
+        )
+        await interaction.response.edit_message(
+            embed=_movie_setup_summary_embed(self.guild, self.state, step=1),
+            view=previous_view,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Save Setup", style=discord.ButtonStyle.success, row=1)
+    async def save_setup(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        if not self.state.core_complete() or self.state.notification_role_id is None:
+            await _ephemeral(interaction, "Choose the customer notification role first.")
+            return
+
+        panel_channel = self.guild.get_channel(self.state.panel_channel_id)
+        ticket_category = self.guild.get_channel(self.state.ticket_category_id)
+        staff_role = self.guild.get_role(self.state.staff_role_id)
+        transcript_channel = self.guild.get_channel(self.state.transcript_channel_id)
+        notification_role = self.guild.get_role(self.state.notification_role_id)
+        bot_member = self.guild.me
+
+        if not isinstance(panel_channel, discord.TextChannel):
+            await _ephemeral(interaction, "The selected storefront channel no longer exists.")
+            return
+        if not isinstance(ticket_category, discord.CategoryChannel):
+            await _ephemeral(interaction, "The selected ticket category no longer exists.")
+            return
+        if staff_role is None or staff_role.is_default():
+            await _ephemeral(interaction, "Choose a private Movie Staff role, not @everyone.")
+            return
+        if not isinstance(transcript_channel, discord.TextChannel):
+            await _ephemeral(interaction, "The selected transcript channel no longer exists.")
+            return
+        if notification_role is None or notification_role.is_default():
+            await _ephemeral(interaction, "Choose a customer role, not @everyone.")
+            return
+        if bot_member is None or not bot_member.guild_permissions.manage_channels:
+            await _ephemeral(interaction, "Give the bot **Manage Channels** permission first.")
+            return
+        if not panel_channel.permissions_for(bot_member).send_messages:
+            await _ephemeral(interaction, "I cannot send messages in the storefront channel.")
+            return
+        if not transcript_channel.permissions_for(bot_member).attach_files:
+            await _ephemeral(interaction, "I need **Attach Files** in the transcript channel.")
+            return
+
+        await interaction.response.defer()
+        previous = await self.bot.db.get_guild_settings(self.guild.id)
+        can_refresh_existing = (
+            previous is not None
+            and previous.panel_channel_id == panel_channel.id
+            and previous.panel_message_id is not None
+        )
+        await self.bot.db.upsert_guild_settings(
+            guild_id=self.guild.id,
+            brand_name=previous.brand_name if previous else "Oxy Movies • 50% Off",
+            ticket_category_id=ticket_category.id,
+            staff_role_id=staff_role.id,
+            notification_role_id=notification_role.id,
+            log_channel_id=transcript_channel.id,
+            banner_url=previous.banner_url if previous else None,
+        )
+        settings = await self.bot.db.get_guild_settings(self.guild.id)
+        assert settings is not None
+
+        panel_updated = can_refresh_existing and await _refresh_saved_panel(
+            self.bot, self.guild, settings
+        )
+        if not panel_updated:
+            orders_open = await self.bot.db.get_store_open(self.guild.id)
+            try:
+                panel_message = await panel_channel.send(
+                    embed=_panel_embed(settings, orders_open),
+                    view=MainPanelView(self.bot, orders_open=orders_open),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                await interaction.edit_original_response(
+                    embed=discord.Embed(
+                        title="Setup Saved — Storefront Could Not Be Posted",
+                        description=(
+                            "Your existing selections were saved, but Discord blocked "
+                            "the storefront message. Check permissions and run `/panel`."
+                        ),
+                        color=ERROR,
+                    ),
+                    view=None,
+                )
+                self.stop()
+                return
+            await self.bot.db.save_panel(self.guild.id, panel_channel.id, panel_message.id)
+
+        self.stop()
+        await interaction.edit_original_response(
+            embed=discord.Embed(
+                title="✅ Direct Movies Setup Saved",
+                description=(
+                    f"Storefront: {panel_channel.mention}\n"
+                    f"Tickets: **{ticket_category.name}**\n"
+                    f"Movie Staff: {staff_role.mention}\n"
+                    f"Transcripts: {transcript_channel.mention}\n"
+                    f"Customer notifications: {notification_role.mention}\n\n"
+                    "No channels or roles were created. Your existing storefront "
+                    "name and banner were preserved."
+                ),
+                color=SUCCESS,
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=1)
+    async def cancel_setup(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await self._cancel(interaction)
+
+
 class MovieCommands(commands.Cog):
     store = app_commands.Group(name="store", description="Open or close movie orders")
     payments = app_commands.Group(
@@ -1086,116 +1599,41 @@ class MovieCommands(commands.Cog):
     def __init__(self, bot: MovieOrdersBot) -> None:
         self.bot = bot
 
-    @app_commands.command(name="setup", description="Configure the movie order system")
+    @app_commands.command(name="setup", description="View or edit the saved movie setup")
     @app_commands.guild_only()
-    @app_commands.describe(
-        panel_channel="Where customers will see the movie order panel",
-        ticket_category="Category where private movie tickets are created",
-        movie_staff_role="Role allowed to view and handle movie orders",
-        transcript_channel="Private channel where closed-ticket transcripts are saved",
-        notification_role="Customer role pinged when movie orders open",
-        brand_name="Storefront title",
-        banner_url="Optional HTTPS image URL for the movie storefront",
-    )
-    async def setup(
-        self,
-        interaction: discord.Interaction,
-        panel_channel: discord.TextChannel,
-        ticket_category: discord.CategoryChannel,
-        transcript_channel: discord.TextChannel,
-        movie_staff_role: discord.Role | None = None,
-        notification_role: discord.Role | None = None,
-        brand_name: app_commands.Range[str, 2, 80] = "Oxy Movies • 50% Off",
-        banner_url: str | None = None,
-    ) -> None:
+    @app_commands.default_permissions(administrator=True)
+    async def setup(self, interaction: discord.Interaction) -> None:
         if not _is_administrator(interaction.user) or interaction.guild is None:
             await _ephemeral(interaction, "Only a server administrator can run setup.")
             return
 
-        resolved_staff_role = movie_staff_role
-        if resolved_staff_role is None and self.bot.settings.movie_staff_role_id:
-            resolved_staff_role = interaction.guild.get_role(
-                self.bot.settings.movie_staff_role_id
-            )
-        resolved_notification_role = notification_role
-        if (
-            resolved_notification_role is None
-            and self.bot.settings.customer_notification_role_id
-        ):
-            resolved_notification_role = interaction.guild.get_role(
-                self.bot.settings.customer_notification_role_id
-            )
-
-        if resolved_staff_role is None:
-            await _ephemeral(
-                interaction,
-                "I could not find the configured **Direct Movies Staff** role. "
-                "Choose it manually in `/setup`.",
-            )
-            return
-        if resolved_staff_role.is_default():
-            await _ephemeral(interaction, "Choose the private Movie Staff role, not @everyone.")
-            return
-        if resolved_notification_role is not None and resolved_notification_role.is_default():
-            await _ephemeral(interaction, "Choose a customer notification role, not @everyone.")
-            return
-        if banner_url and not _valid_http_url(banner_url):
-            await _ephemeral(interaction, "The banner must be a valid HTTP or HTTPS image URL.")
-            return
-
-        bot_member = interaction.guild.me
-        if bot_member is None or not bot_member.guild_permissions.manage_channels:
-            await _ephemeral(
-                interaction,
-                "Give the movie bot **Manage Channels** permission before running setup.",
-            )
-            return
-        if not panel_channel.permissions_for(bot_member).send_messages:
-            await _ephemeral(interaction, "I cannot send messages in the storefront channel.")
-            return
-        if not transcript_channel.permissions_for(bot_member).attach_files:
-            await _ephemeral(
-                interaction,
-                "I need **Attach Files** permission in the transcript channel.",
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.bot.db.upsert_guild_settings(
-            guild_id=interaction.guild.id,
-            brand_name=brand_name.strip(),
-            ticket_category_id=ticket_category.id,
-            staff_role_id=resolved_staff_role.id,
-            notification_role_id=(
-                resolved_notification_role.id
-                if resolved_notification_role is not None
-                else None
-            ),
-            log_channel_id=transcript_channel.id,
-            banner_url=banner_url.strip() if banner_url else None,
+        existing = await self.bot.db.get_guild_settings(interaction.guild.id)
+        state = MovieSetupSelections.from_settings(
+            interaction.guild,
+            existing,
+            self.bot.settings.movie_staff_role_id,
+            self.bot.settings.customer_notification_role_id,
         )
-        settings = await self.bot.db.get_guild_settings(interaction.guild.id)
-        assert settings is not None
-        orders_open = await self.bot.db.get_store_open(interaction.guild.id)
-        panel_message = await panel_channel.send(
-            embed=_panel_embed(settings, orders_open),
-            view=MainPanelView(self.bot, orders_open=orders_open),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        await self.bot.db.save_panel(interaction.guild.id, panel_channel.id, panel_message.id)
-        notification_text = (
-            f" Opening alerts will ping {resolved_notification_role.mention}."
-            if resolved_notification_role is not None
-            else " No customer notification role was selected."
-        )
-        await interaction.followup.send(
-            (
-                f"Movie storefront posted in {panel_channel.mention}. Private tickets will "
-                f"open under **{ticket_category.name}** for {resolved_staff_role.mention}."
-                f"{notification_text}"
-            ),
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
+        if existing is not None and state.core_complete():
+            view: discord.ui.View = MovieSetupStatusView(
+                self.bot,
+                interaction.guild,
+                interaction.user.id,
+                state,
+            )
+            step = 0
+        else:
+            view = MovieSetupCoreView(
+                self.bot,
+                interaction.guild,
+                interaction.user.id,
+                state,
+            )
+            step = 1
+        await _ephemeral(
+            interaction,
+            embed=_movie_setup_summary_embed(interaction.guild, state, step=step),
+            view=view,
         )
 
     @app_commands.command(name="panel", description="Refresh or repost the movie storefront")

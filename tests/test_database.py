@@ -40,6 +40,15 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         assert settings is not None
         self.assertEqual(settings.staff_role_id, 3)
         self.assertEqual(settings.notification_role_id, 4)
+        await self.db.save_panel(1, 10, 11)
+        await self.db.initialize()
+        persisted_settings = await self.db.get_guild_settings(1)
+        self.assertIsNotNone(persisted_settings)
+        assert persisted_settings is not None
+        self.assertEqual(persisted_settings.ticket_category_id, 2)
+        self.assertEqual(persisted_settings.log_channel_id, 5)
+        self.assertEqual(persisted_settings.panel_channel_id, 10)
+        self.assertEqual(persisted_settings.panel_message_id, 11)
 
         self.assertTrue(await self.db.get_store_open(1))
         await self.db.set_store_open(1, False)
